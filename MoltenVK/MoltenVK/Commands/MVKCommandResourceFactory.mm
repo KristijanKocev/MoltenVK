@@ -559,6 +559,13 @@ id<MTLComputePipelineState> MVKCommandResourceFactory::newCmdDrawIndirectConvert
 									  : "cmdDrawIndirectConvertBuffers", owner);
 }
 
+id<MTLComputePipelineState> MVKCommandResourceFactory::newCmdDrawIndirectGeometryConvertBuffersMTLComputePipelineState(bool indexed,
+																													 MVKVulkanAPIDeviceObject* owner) {
+	return newMTLComputePipelineState(indexed
+									  ? "cmdDrawIndexedIndirectGeometryConvertBuffers"
+									  : "cmdDrawIndirectGeometryConvertBuffers", owner);
+}
+
 id<MTLComputePipelineState> MVKCommandResourceFactory::newCmdDrawIndirectPopulateIndexesMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner) {
 	return newMTLComputePipelineState("cmdDrawIndirectPopulateIndexes", owner);
 }
@@ -696,4 +703,3 @@ MVKCommandResourceFactory::~MVKCommandResourceFactory() {
 	_mtlLibrary = nil;
 	if (_transferImageMemory) { _transferImageMemory->destroy(); }
 }
-

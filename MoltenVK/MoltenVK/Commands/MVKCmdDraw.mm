@@ -23,6 +23,212 @@
 #include "MVKPipeline.h"
 #include "MVKFoundation.h"
 #include "mvk_datatypes.hpp"
+#include <atomic>
+#include <objc/message.h>
+
+typedef struct MVKGeometryDrawInfo {
+	int32_t indexed = 0;
+	int32_t indexSize = 0;
+	uint64_t indexBuffer = 0;
+	int32_t firstVertex = 0;
+	int32_t baseVertex = 0;
+	int32_t firstInstance = 0;
+} MVKGeometryDrawInfo;
+
+typedef struct MVKDrawMeshThreadgroupsIndirectArguments {
+	uint32_t threadgroupsPerGrid[3] = {0, 0, 0};
+} MVKDrawMeshThreadgroupsIndirectArguments;
+
+typedef enum : uint32_t {
+	kMVKGeometryPrimitiveTopologyPoints = 0,
+	kMVKGeometryPrimitiveTopologyTriangles = 1,
+	kMVKGeometryPrimitiveTopologyTriangleStrip = 2,
+} MVKGeometryPrimitiveTopology;
+
+static uint32_t mvkGeometryPrimitiveCount(VkPrimitiveTopology topology, uint32_t vertexOrIndexCount) {
+	switch (topology) {
+		case VK_PRIMITIVE_TOPOLOGY_POINT_LIST:
+			return vertexOrIndexCount;
+		case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST:
+			return vertexOrIndexCount / 3;
+		case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP:
+			return vertexOrIndexCount >= 3 ? (vertexOrIndexCount - 2) : 0;
+		default:
+			return 0;
+	}
+}
+
+static uint32_t mvkGeometryPrimitiveTopology(VkPrimitiveTopology topology) {
+	switch (topology) {
+		case VK_PRIMITIVE_TOPOLOGY_POINT_LIST: return kMVKGeometryPrimitiveTopologyPoints;
+		case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST: return kMVKGeometryPrimitiveTopologyTriangles;
+		case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP: return kMVKGeometryPrimitiveTopologyTriangleStrip;
+		default: return UINT32_MAX;
+	}
+}
+
+static bool mvkSupportsGeometryDrawSelectors(id<MTLRenderCommandEncoder> mtlRendEnc) {
+	return [mtlRendEnc respondsToSelector:@selector(setObjectBytes:length:atIndex:)] &&
+		   [mtlRendEnc respondsToSelector:@selector(setObjectBuffer:offset:atIndex:)] &&
+		   [mtlRendEnc respondsToSelector:@selector(drawMeshThreadgroups:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:)] &&
+		   [mtlRendEnc respondsToSelector:@selector(drawMeshThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:)];
+}
+
+static void mvkWarnGeometryDrawSupport(MVKCommandEncoder* cmdEncoder) {
+	static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+	if (!warned.test_and_set()) {
+		cmdEncoder->reportWarning(VK_ERROR_FEATURE_NOT_PRESENT,
+								  "Geometry emulation requires Metal object/mesh draw support "
+								  "for draw encoding.");
+	}
+}
+
+static inline void mvkSetObjectBytes(id<MTLRenderCommandEncoder> mtlRendEnc,
+									 const void* bytes,
+									 NSUInteger length,
+									 NSUInteger index) {
+	reinterpret_cast<void(*)(id, SEL, const void*, NSUInteger, NSUInteger)>(objc_msgSend)(
+		mtlRendEnc, @selector(setObjectBytes:length:atIndex:), bytes, length, index);
+}
+
+static inline void mvkSetObjectBuffer(id<MTLRenderCommandEncoder> mtlRendEnc,
+									  id<MTLBuffer> mtlBuffer,
+									  NSUInteger offset,
+									  NSUInteger index) {
+	reinterpret_cast<void(*)(id, SEL, id<MTLBuffer>, NSUInteger, NSUInteger)>(objc_msgSend)(
+		mtlRendEnc, @selector(setObjectBuffer:offset:atIndex:), mtlBuffer, offset, index);
+}
+
+static inline void mvkDrawMeshThreadgroups(id<MTLRenderCommandEncoder> mtlRendEnc,
+										   MTLSize threadgroupsPerGrid,
+										   MTLSize threadsPerObjectThreadgroup,
+										   MTLSize threadsPerMeshThreadgroup) {
+	reinterpret_cast<void(*)(id, SEL, MTLSize, MTLSize, MTLSize)>(objc_msgSend)(
+		mtlRendEnc,
+		@selector(drawMeshThreadgroups:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:),
+		threadgroupsPerGrid,
+		threadsPerObjectThreadgroup,
+		threadsPerMeshThreadgroup);
+}
+
+static inline void mvkDrawMeshThreadgroupsIndirect(id<MTLRenderCommandEncoder> mtlRendEnc,
+												   id<MTLBuffer> mtlIndirectBuffer,
+												   NSUInteger indirectBufferOffset,
+												   MTLSize threadsPerObjectThreadgroup,
+												   MTLSize threadsPerMeshThreadgroup) {
+	reinterpret_cast<void(*)(id, SEL, id<MTLBuffer>, NSUInteger, MTLSize, MTLSize)>(objc_msgSend)(
+		mtlRendEnc,
+		@selector(drawMeshThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:),
+		mtlIndirectBuffer,
+		indirectBufferOffset,
+		threadsPerObjectThreadgroup,
+		threadsPerMeshThreadgroup);
+}
+
+static void mvkEncodeGeometryDraw(MVKCommandEncoder* cmdEncoder,
+								  MVKGraphicsPipeline* pipeline,
+								  uint32_t primitiveCount,
+								  uint32_t instanceCount,
+								  const MVKGeometryDrawInfo& drawInfo) {
+	if (primitiveCount == 0 || instanceCount == 0) { return; }
+	id<MTLRenderCommandEncoder> mtlRendEnc = cmdEncoder->_mtlRenderEncoder;
+	if (!mvkSupportsGeometryDrawSelectors(mtlRendEnc)) {
+		mvkWarnGeometryDrawSupport(cmdEncoder);
+		return;
+	}
+	uint32_t drawInfoIdx = pipeline->getImplicitBuffers(kMVKShaderStageVertex).ids[MVKImplicitBuffer::IndirectParams];
+	mvkSetObjectBytes(mtlRendEnc, &drawInfo, sizeof(drawInfo), drawInfoIdx);
+	MTLSize one = MTLSizeMake(1, 1, 1);
+	mvkDrawMeshThreadgroups(mtlRendEnc,
+							MTLSizeMake(primitiveCount, instanceCount, 1),
+							one,
+							one);
+}
+
+static uint64_t mvkGetGPUAddress(id<MTLBuffer> buffer, VkDeviceSize offset) {
+	if (@available(macOS 13.0, iOS 16.0, *)) {
+		return static_cast<uint64_t>(buffer.gpuAddress + offset);
+	}
+	return 0;
+}
+
+static bool mvkEncodeGeometryIndirectDraws(MVKCommandEncoder* cmdEncoder,
+										   MVKGraphicsPipeline* pipeline,
+										   id<MTLBuffer> mtlIndirectBuffer,
+										   VkDeviceSize mtlIndirectBufferOffset,
+										   uint32_t mtlIndirectBufferStride,
+										   uint32_t drawCount,
+										   const MVKIndexMTLBufferBinding* pIdxBinding,
+										   uint32_t firstInstanceForZeroDivisor) {
+	if (drawCount == 0) { return true; }
+	id<MTLRenderCommandEncoder> mtlRendEnc = cmdEncoder->_mtlRenderEncoder;
+	if (!mvkSupportsGeometryDrawSelectors(mtlRendEnc)) {
+		mvkWarnGeometryDrawSupport(cmdEncoder);
+		return false;
+	}
+
+	uint32_t primitiveTopology = mvkGeometryPrimitiveTopology(pipeline->getVkPrimitiveTopology());
+	if (primitiveTopology == UINT32_MAX) {
+		cmdEncoder->reportWarning(VK_ERROR_FEATURE_NOT_PRESENT,
+								  "Geometry emulation indirect draw received an unsupported "
+								  "primitive topology.");
+		return false;
+	}
+
+	bool indexed = pIdxBinding != nullptr;
+	const size_t meshArgsStride = sizeof(MVKDrawMeshThreadgroupsIndirectArguments);
+	const size_t drawInfoStride = sizeof(MVKGeometryDrawInfo);
+	const MVKMTLBufferAllocation* meshArgsBuff = cmdEncoder->getTempMTLBuffer(meshArgsStride * drawCount, true);
+	const MVKMTLBufferAllocation* drawInfoBuff = cmdEncoder->getTempMTLBuffer(drawInfoStride * drawCount, true);
+
+	cmdEncoder->encodeStoreActions(true);
+	id<MTLComputeCommandEncoder> mtlConvertEncoder = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseDrawIndirectConvertBuffers);
+	MVKMetalComputeCommandEncoderState& state = cmdEncoder->getMtlCompute();
+	id<MTLComputePipelineState> mtlConvertState = cmdEncoder->getCommandEncodingPool()->getCmdDrawIndirectGeometryConvertBuffersMTLComputePipelineState(indexed);
+	state.bindPipeline(mtlConvertEncoder, mtlConvertState);
+	state.bindBuffer(mtlConvertEncoder, mtlIndirectBuffer, mtlIndirectBufferOffset, 0);
+	state.bindBuffer(mtlConvertEncoder, meshArgsBuff->_mtlBuffer, meshArgsBuff->_offset, 1);
+	state.bindBuffer(mtlConvertEncoder, drawInfoBuff->_mtlBuffer, drawInfoBuff->_offset, 2);
+	state.bindStructBytes(mtlConvertEncoder, &mtlIndirectBufferStride, 3);
+	state.bindStructBytes(mtlConvertEncoder, &drawCount, 4);
+	state.bindStructBytes(mtlConvertEncoder, &primitiveTopology, 5);
+	if (indexed) {
+		uint32_t indexTypeSize = static_cast<uint32_t>(mvkMTLIndexTypeSizeInBytes((MTLIndexType)pIdxBinding->mtlIndexType));
+		uint64_t indexBufferAddress = mvkGetGPUAddress(pIdxBinding->mtlBuffer, pIdxBinding->offset);
+		if (indexTypeSize == 0 || indexBufferAddress == 0) {
+			cmdEncoder->reportWarning(VK_ERROR_FEATURE_NOT_PRESENT,
+									  "Geometry emulation indirect indexed draw requires a "
+									  "GPU-addressable index buffer.");
+			return false;
+		}
+		state.bindStructBytes(mtlConvertEncoder, &indexTypeSize, 6);
+		state.bindStructBytes(mtlConvertEncoder, &indexBufferAddress, 7);
+	}
+	if (cmdEncoder->getMetalFeatures().nonUniformThreadgroups) {
+		[mtlConvertEncoder dispatchThreads: MTLSizeMake(drawCount, 1, 1)
+					 threadsPerThreadgroup: MTLSizeMake(mtlConvertState.threadExecutionWidth, 1, 1)];
+	} else {
+		[mtlConvertEncoder dispatchThreadgroups: MTLSizeMake(mvkCeilingDivide<NSUInteger>(drawCount, mtlConvertState.threadExecutionWidth), 1, 1)
+						  threadsPerThreadgroup: MTLSizeMake(mtlConvertState.threadExecutionWidth, 1, 1)];
+	}
+	cmdEncoder->beginMetalRenderPass(kMVKCommandUseRestartSubpass);
+
+	MVKGraphicsStage stage = kMVKGraphicsStageRasterization;
+	cmdEncoder->finalizeDrawState(stage);
+	if (!pipeline->hasValidMTLPipelineStates()) { return false; }
+	cmdEncoder->getState().offsetZeroDivisorVertexBuffers(*cmdEncoder, stage, pipeline, firstInstanceForZeroDivisor);
+
+	uint32_t drawInfoIdx = pipeline->getImplicitBuffers(kMVKShaderStageVertex).ids[MVKImplicitBuffer::IndirectParams];
+	MTLSize one = MTLSizeMake(1, 1, 1);
+	for (uint32_t drawIdx = 0; drawIdx < drawCount; ++drawIdx) {
+		NSUInteger drawInfoOffset = drawInfoBuff->_offset + drawInfoStride * drawIdx;
+		NSUInteger meshArgsOffset = meshArgsBuff->_offset + meshArgsStride * drawIdx;
+		mvkSetObjectBuffer(mtlRendEnc, drawInfoBuff->_mtlBuffer, drawInfoOffset, drawInfoIdx);
+		mvkDrawMeshThreadgroupsIndirect(mtlRendEnc, meshArgsBuff->_mtlBuffer, meshArgsOffset, one, one);
+	}
+
+	return true;
+}
 
 
 #pragma mark -
@@ -350,6 +556,15 @@ void MVKCmdDraw::encode(MVKCommandEncoder* cmdEncoder) {
                                         patchIndexBufferOffset: 0
                                                  instanceCount: 1
                                                   baseInstance: 0];
+                } else if (pipeline->isGeometryMeshPipeline()) {
+                    cmdEncoder->getState().offsetZeroDivisorVertexBuffers(*cmdEncoder, stage, pipeline, _firstInstance);
+                    MVKGeometryDrawInfo drawInfo = {};
+                    drawInfo.indexed = 0;
+                    drawInfo.firstVertex = static_cast<int32_t>(_firstVertex);
+                    drawInfo.baseVertex = 0;
+                    drawInfo.firstInstance = static_cast<int32_t>(_firstInstance);
+                    uint32_t primitiveCount = mvkGeometryPrimitiveCount(pipeline->getVkPrimitiveTopology(), _vertexCount);
+                    mvkEncodeGeometryDraw(cmdEncoder, pipeline, primitiveCount, _instanceCount, drawInfo);
                 } else {
                     MVKRenderSubpass* subpass = cmdEncoder->getSubpass();
                     uint32_t viewCount = subpass->isMultiview() ? subpass->getViewCountInMetalPass(cmdEncoder->getMultiviewPassIndex()) : 1;
@@ -570,6 +785,17 @@ void MVKCmdDrawIndexed::encode(MVKCommandEncoder* cmdEncoder) {
                                         patchIndexBufferOffset: 0
                                                  instanceCount: 1
                                                   baseInstance: 0];
+                } else if (pipeline->isGeometryMeshPipeline()) {
+                    cmdEncoder->getState().offsetZeroDivisorVertexBuffers(*cmdEncoder, stage, pipeline, _firstInstance);
+                    MVKGeometryDrawInfo drawInfo = {};
+                    drawInfo.indexed = 1;
+                    drawInfo.indexSize = static_cast<int32_t>(idxSize);
+                    drawInfo.indexBuffer = mvkGetGPUAddress(ibb.mtlBuffer, idxBuffOffset);
+                    drawInfo.firstVertex = 0;
+                    drawInfo.baseVertex = _vertexOffset;
+                    drawInfo.firstInstance = static_cast<int32_t>(_firstInstance);
+                    uint32_t primitiveCount = mvkGeometryPrimitiveCount(pipeline->getVkPrimitiveTopology(), _indexCount);
+                    mvkEncodeGeometryDraw(cmdEncoder, pipeline, primitiveCount, _instanceCount, drawInfo);
                 } else {
                     MVKRenderSubpass* subpass = cmdEncoder->getSubpass();
                     uint32_t viewCount = subpass->isMultiview() ? subpass->getViewCountInMetalPass(cmdEncoder->getMultiviewPassIndex()) : 1;
@@ -685,6 +911,18 @@ void MVKCmdDrawIndirect::encode(MVKCommandEncoder* cmdEncoder) {
 	auto* pipeline = cmdEncoder->getGraphicsPipeline();
 	auto& mtlFeats = cmdEncoder->getMetalFeatures();
 	auto& dvcLimits = cmdEncoder->getDeviceProperties().limits;
+
+	if (pipeline->isGeometryMeshPipeline()) {
+		mvkEncodeGeometryIndirectDraws(cmdEncoder,
+									   pipeline,
+									   _mtlIndirectBuffer,
+									   _mtlIndirectBufferOffset,
+									   _mtlIndirectBufferStride,
+									   _drawCount,
+									   nullptr,
+									   0);
+		return;
+	}
 
 	// Metal doesn't support triangle fans, so encode it as indexed indirect triangles instead.
 	if (pipeline->getVkPrimitiveTopology() == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) {
@@ -979,6 +1217,18 @@ void MVKCmdDrawIndexedIndirect::encode(MVKCommandEncoder* cmdEncoder, const MVKI
 	auto& mtlFeats = cmdEncoder->getMetalFeatures();
 	auto& dvcLimits = cmdEncoder->getDeviceProperties().limits;
 
+	if (pipeline->isGeometryMeshPipeline()) {
+		mvkEncodeGeometryIndirectDraws(cmdEncoder,
+									   pipeline,
+									   _mtlIndirectBuffer,
+									   _mtlIndirectBufferOffset,
+									   _mtlIndirectBufferStride,
+									   _drawCount,
+									   &ibb,
+									   _directCmdFirstInstance);
+		return;
+	}
+
 	MVKVertexAdjustments vtxAdjmts{};
 	vtxAdjmts.mtlIndexType = ibb.mtlIndexType;
 	vtxAdjmts.isMultiView = (cmdEncoder->getSubpass()->isMultiview() &&
@@ -1237,4 +1487,3 @@ void MVKCmdDrawIndexedIndirect::encode(MVKCommandEncoder* cmdEncoder, const MVKI
         }
     }
 }
-

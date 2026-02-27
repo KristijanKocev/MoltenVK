@@ -356,6 +356,10 @@ public:
 	id<MTLComputePipelineState> newCmdDrawIndirectConvertBuffersMTLComputePipelineState(bool indexed,
 																						MVKVulkanAPIDeviceObject* owner);
 
+	/** Returns a new MTLComputePipelineState for converting indirect draws for geometry emulation. */
+	id<MTLComputePipelineState> newCmdDrawIndirectGeometryConvertBuffersMTLComputePipelineState(bool indexed,
+																								 MVKVulkanAPIDeviceObject* owner);
+
 	/** Returns a new MTLComputePipelineState for converting an indirect buffer for use in a tessellated draw. */
 	id<MTLComputePipelineState> newCmdDrawIndirectTessConvertBuffersMTLComputePipelineState(bool indexed,
 																							MVKVulkanAPIDeviceObject* owner);
@@ -397,4 +401,3 @@ protected:
 	id<MTLLibrary> _mtlLibrary;
 	MVKDeviceMemory* _transferImageMemory;
 };
-

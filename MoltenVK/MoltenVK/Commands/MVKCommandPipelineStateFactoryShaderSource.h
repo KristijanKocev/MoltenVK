@@ -295,6 +295,88 @@ kernel void cmdDrawIndirectConvertBuffers(const device char* srcBuff [[buffer(0)
 	destBuff[idx].instanceCount *= viewCount;
 }
 
+typedef enum : uint32_t {
+	MVKGeometryPrimitiveTopologyPoints = 0,
+	MVKGeometryPrimitiveTopologyTriangles = 1,
+	MVKGeometryPrimitiveTopologyTriangleStrip = 2,
+} MVKGeometryPrimitiveTopology;
+
+typedef struct {
+	uint32_t threadgroupsPerGrid[3];
+} MVKDrawMeshThreadgroupsIndirectArguments;
+
+typedef struct alignas(8) {
+	int32_t indexed;
+	int32_t indexSize;
+	uint64_t indexBuffer;
+	int32_t firstVertex;
+	int32_t baseVertex;
+	int32_t firstInstance;
+} MVKGeometryDrawInfo;
+
+inline uint32_t mvkGeometryPrimitiveCount(uint32_t primitiveTopology, uint32_t vertexOrIndexCount) {
+	switch (primitiveTopology) {
+		case MVKGeometryPrimitiveTopologyPoints:
+			return vertexOrIndexCount;
+		case MVKGeometryPrimitiveTopologyTriangles:
+			return vertexOrIndexCount / 3;
+		case MVKGeometryPrimitiveTopologyTriangleStrip:
+			return vertexOrIndexCount >= 3 ? (vertexOrIndexCount - 2) : 0;
+		default:
+			return 0;
+	}
+}
+
+kernel void cmdDrawIndirectGeometryConvertBuffers(const device char* srcBuff [[buffer(0)]],
+                                                  device MVKDrawMeshThreadgroupsIndirectArguments* meshArgsBuff [[buffer(1)]],
+                                                  device MVKGeometryDrawInfo* drawInfoBuff [[buffer(2)]],
+                                                  constant uint32_t& srcStride [[buffer(3)]],
+                                                  constant uint32_t& drawCount [[buffer(4)]],
+                                                  constant uint32_t& primitiveTopology [[buffer(5)]],
+                                                  uint idx [[thread_position_in_grid]]) {
+	if (idx >= drawCount) { return; }
+	const device auto& src = *reinterpret_cast<const device MTLDrawPrimitivesIndirectArguments*>(srcBuff + idx * srcStride);
+
+	device auto& meshArgs = meshArgsBuff[idx];
+	meshArgs.threadgroupsPerGrid[0] = mvkGeometryPrimitiveCount(primitiveTopology, src.vertexCount);
+	meshArgs.threadgroupsPerGrid[1] = src.instanceCount;
+	meshArgs.threadgroupsPerGrid[2] = 1;
+
+	device auto& drawInfo = drawInfoBuff[idx];
+	drawInfo.indexed = 0;
+	drawInfo.indexSize = 0;
+	drawInfo.indexBuffer = 0;
+	drawInfo.firstVertex = int32_t(src.vertexStart);
+	drawInfo.baseVertex = 0;
+	drawInfo.firstInstance = int32_t(src.baseInstance);
+}
+
+kernel void cmdDrawIndexedIndirectGeometryConvertBuffers(const device char* srcBuff [[buffer(0)]],
+                                                         device MVKDrawMeshThreadgroupsIndirectArguments* meshArgsBuff [[buffer(1)]],
+                                                         device MVKGeometryDrawInfo* drawInfoBuff [[buffer(2)]],
+                                                         constant uint32_t& srcStride [[buffer(3)]],
+                                                         constant uint32_t& drawCount [[buffer(4)]],
+                                                         constant uint32_t& primitiveTopology [[buffer(5)]],
+                                                         constant uint32_t& indexTypeSize [[buffer(6)]],
+                                                         constant uint64_t& indexBufferAddress [[buffer(7)]],
+                                                         uint idx [[thread_position_in_grid]]) {
+	if (idx >= drawCount) { return; }
+	const device auto& src = *reinterpret_cast<const device MTLDrawIndexedPrimitivesIndirectArguments*>(srcBuff + idx * srcStride);
+
+	device auto& meshArgs = meshArgsBuff[idx];
+	meshArgs.threadgroupsPerGrid[0] = mvkGeometryPrimitiveCount(primitiveTopology, src.indexCount);
+	meshArgs.threadgroupsPerGrid[1] = src.instanceCount;
+	meshArgs.threadgroupsPerGrid[2] = 1;
+
+	device auto& drawInfo = drawInfoBuff[idx];
+	drawInfo.indexed = 1;
+	drawInfo.indexSize = int32_t(indexTypeSize);
+	drawInfo.indexBuffer = indexBufferAddress + uint64_t(src.indexStart) * uint64_t(indexTypeSize);
+	drawInfo.firstVertex = 0;
+	drawInfo.baseVertex = int32_t(src.baseVertex);
+	drawInfo.firstInstance = int32_t(src.baseInstance);
+}
+
 kernel void cmdDrawIndexedIndirectConvertBuffers(const device char* srcBuff [[buffer(0)]],
                                                  device MTLDrawIndexedPrimitivesIndirectArguments* destBuff [[buffer(1)]],
                                                  constant uint32_t& srcStride [[buffer(2)]],

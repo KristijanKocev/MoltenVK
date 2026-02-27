@@ -28,6 +28,7 @@
 #include <sys/stat.h>
 #include <sstream>
 #include <atomic>
+#include <objc/message.h>
 
 #ifndef MVK_USE_CEREAL
 #define MVK_USE_CEREAL (1)
@@ -109,6 +110,14 @@ static mvk::DescriptorBinding makeDescriptorBinding(MVKShaderStage stage, uint32
 	db.binding = bindingIndex;
 	db.index = dynamicOffsetIndex;
 	return db;
+}
+
+static inline void mvkSetObjectFunction(MTLRenderPipelineDescriptor* plDesc, id<MTLFunction> mtlFunc) {
+	reinterpret_cast<void(*)(id, SEL, id<MTLFunction>)>(objc_msgSend)(plDesc, @selector(setObjectFunction:), mtlFunc);
+}
+
+static inline void mvkSetMeshFunction(MTLRenderPipelineDescriptor* plDesc, id<MTLFunction> mtlFunc) {
+	reinterpret_cast<void(*)(id, SEL, id<MTLFunction>)>(objc_msgSend)(plDesc, @selector(setMeshFunction:), mtlFunc);
 }
 
 static void addResourceBindingToShaderConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
@@ -704,8 +713,8 @@ static void warnGeometryShaderPassthrough(MVKGraphicsPipeline* pipeline) {
 	static std::atomic_flag warned = ATOMIC_FLAG_INIT;
 	if (!warned.test_and_set()) {
 		pipeline->reportWarning(VK_SUCCESS,
-								"Geometry shader emulation is enabled, but this build currently uses "
-								"an experimental passthrough fallback. Visual output may be incorrect.");
+								"Geometry shader emulation is enabled and uses an experimental "
+								"object/mesh translation path.");
 	}
 }
 
@@ -811,19 +820,43 @@ MVKGraphicsPipeline::MVKGraphicsPipeline(MVKDevice* device,
 		if (!getMVKConfig().geometryShaderEmulationEnabled) {
 			setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT,
 											   "Geometry shaders are disabled. Enable "
-											   "MVK_CONFIG_GEOMETRY_SHADER_EMULATION to allow the "
-											   "experimental geometry passthrough fallback."));
+											   "MVK_CONFIG_GEOMETRY_SHADER_EMULATION to allow "
+											   "experimental geometry emulation."));
+			return;
+		}
+		if (pTessCtlSS || pTessEvalSS) {
+			setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT,
+											   "Pipelines that combine tessellation and geometry shaders "
+											   "are not currently supported by MoltenVK geometry emulation."));
+			return;
+		}
+		if (_dynamicStateFlags.has(MVKRenderStateFlag::VertexStride)) {
+			setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT,
+											   "Geometry emulation currently does not support "
+											   "VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE."));
+			return;
+		}
+		if (_dynamicStateFlags.has(MVKRenderStateFlag::PrimitiveTopology)) {
+			setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT,
+											   "Geometry emulation currently does not support "
+											   "VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY."));
+			return;
+		}
+		if (!pVertexSS) {
+			setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED,
+											   "Geometry emulation requires a vertex shader stage."));
+			return;
+		}
+		if (!initGeometryMeshPipelineConfig(pCreateInfo)) {
 			return;
 		}
 		warnGeometryShaderPassthrough(this);
-		if (pGeometryFB) {
-			mvkDisableFlags(pGeometryFB->flags, VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT);
-		}
 	}
 
 	_vertexModule = getOrCreateShaderModule(device, pVertexSS, _ownsVertexModule);
 	_tessCtlModule = getOrCreateShaderModule(device, pTessCtlSS, _ownsTessCtlModule);
 	_tessEvalModule = getOrCreateShaderModule(device, pTessEvalSS, _ownsTessEvalModule);
+	_geometryModule = getOrCreateShaderModule(device, pGeometrySS, _ownsGeometryModule);
 	_fragmentModule = getOrCreateShaderModule(device, pFragmentSS, _ownsFragmentModule);
 
 	warnIfUnsupportedRobustnessEnabled(this, pVertexSS);
@@ -890,7 +923,7 @@ MVKGraphicsPipeline::MVKGraphicsPipeline(MVKDevice* device,
 	}
 
 	// Render pipeline state. Do this as early as possible, to fail fast if pipeline requires a fail on cache-miss.
-	initMTLRenderPipelineState(pCreateInfo, reflectData, pPipelineFB, pVertexSS, pVertexFB, pTessCtlSS, pTessCtlFB, pTessEvalSS, pTessEvalFB, pFragmentSS, pFragmentFB);
+	initMTLRenderPipelineState(pCreateInfo, reflectData, pPipelineFB, pVertexSS, pVertexFB, pTessCtlSS, pTessCtlFB, pTessEvalSS, pTessEvalFB, pGeometrySS, pGeometryFB, pFragmentSS, pFragmentFB);
 	if ( !_hasValidMTLPipelineStates ) { return; }
 
 	// Blending - must ignore allowed bad pColorBlendState pointer if rasterization disabled or no color attachments
@@ -1051,6 +1084,72 @@ id<MTLComputePipelineState> MVKGraphicsPipeline::getOrCompilePipeline(MTLCompute
 	return plState;
 }
 
+bool MVKGraphicsPipeline::supportsGeometryMeshPipeline() const {
+	if (getMetalFeatures().mslVersion < CompilerMSL::Options::make_msl_version(3, 0, 0)) {
+		return false;
+	}
+	id<MTLDevice> mtlDev = getMTLDevice();
+	if (![mtlDev respondsToSelector:@selector(supportsFamily:)]) {
+		return false;
+	}
+#if MVK_MACOS
+	if (![mtlDev supportsFamily:MTLGPUFamilyMac2]) {
+		return false;
+	}
+#else
+	if (![mtlDev supportsFamily:MTLGPUFamilyApple7]) {
+		return false;
+	}
+#endif
+	if (![MTLRenderPipelineDescriptor instancesRespondToSelector:@selector(setObjectFunction:)]) {
+		return false;
+	}
+	if (![MTLRenderPipelineDescriptor instancesRespondToSelector:@selector(setMeshFunction:)]) {
+		return false;
+	}
+	return true;
+}
+
+bool MVKGraphicsPipeline::initGeometryMeshPipelineConfig(const VkGraphicsPipelineCreateInfo* pCreateInfo) {
+	if (!supportsGeometryMeshPipeline()) {
+		setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT,
+										   "Geometry shader emulation requires Metal object/mesh shader support "
+										   "(macOS 13+/iOS 16+ with MSL 3.0+)."));
+		return false;
+	}
+
+	VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+	if (pCreateInfo->pInputAssemblyState) {
+		topology = pCreateInfo->pInputAssemblyState->topology;
+	}
+	switch (topology) {
+		case VK_PRIMITIVE_TOPOLOGY_POINT_LIST:
+			_geometryInputPrimitiveType = CompilerMSL::Options::PrimitiveTopology::Points;
+			break;
+		case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST:
+			_geometryInputPrimitiveType = CompilerMSL::Options::PrimitiveTopology::Triangles;
+			break;
+		case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP:
+			_geometryInputPrimitiveType = CompilerMSL::Options::PrimitiveTopology::TriangleStrip;
+			break;
+		default:
+			setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT,
+											   "Geometry emulation currently supports only point-list, "
+											   "triangle-list, and triangle-strip input topologies."));
+			return false;
+	}
+
+	const VkPipelineRenderingCreateInfo* pRendInfo = getRenderingCreateInfo(pCreateInfo);
+	if (mvkIsMultiview(pRendInfo->viewMask)) {
+		setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT,
+										   "Geometry emulation currently does not support multiview."));
+		return false;
+	}
+
+	_isGeometryMeshPipeline = true;
+	return true;
+}
+
 // Must run after _isRasterizing and _dynamicState are populated
 void MVKGraphicsPipeline::initSampleLocations(const VkGraphicsPipelineCreateInfo* pCreateInfo) {
 	// Must ignore allowed bad pMultisampleState pointer if rasterization disabled
@@ -1087,6 +1186,8 @@ void MVKGraphicsPipeline::initMTLRenderPipelineState(const VkGraphicsPipelineCre
 													 VkPipelineCreationFeedback* pTessCtlFB,
 													 const VkPipelineShaderStageCreateInfo* pTessEvalSS,
 													 VkPipelineCreationFeedback* pTessEvalFB,
+													 const VkPipelineShaderStageCreateInfo* pGeometrySS,
+													 VkPipelineCreationFeedback* pGeometryFB,
 													 const VkPipelineShaderStageCreateInfo* pFragmentSS,
 													 VkPipelineCreationFeedback* pFragmentFB) {
 	_mtlTessVertexStageState = nil;
@@ -1118,6 +1219,7 @@ void MVKGraphicsPipeline::initMTLRenderPipelineState(const VkGraphicsPipelineCre
 		addShader(" VS", _vertexModule);
 		addShader("TCS", _tessCtlModule);
 		addShader("TES", _tessEvalModule);
+		addShader(" GS", _geometryModule);
 		addShader(" FS", _fragmentModule);
 		mkdir(dumpDir, 0755);
 		snprintf(filename, sizeof(filename), "%s/pipeline%s-%016zx.txt", dumpDir, type, full_hash);
@@ -1129,7 +1231,7 @@ void MVKGraphicsPipeline::initMTLRenderPipelineState(const VkGraphicsPipelineCre
 	}
 
 	if (!isTessellationPipeline()) {
-		MTLRenderPipelineDescriptor* plDesc = newMTLRenderPipelineDescriptor(pCreateInfo, reflectData, pVertexSS, pVertexFB, pFragmentSS, pFragmentFB);	// temp retain
+		MTLRenderPipelineDescriptor* plDesc = newMTLRenderPipelineDescriptor(pCreateInfo, reflectData, pVertexSS, pVertexFB, pGeometrySS, pGeometryFB, pFragmentSS, pFragmentFB);	// temp retain
 		if (plDesc) {
 			auto viewMask = getRenderingCreateInfo(pCreateInfo)->viewMask;
 			if (mvkIsMultiview(viewMask)) {
@@ -1203,6 +1305,8 @@ MTLRenderPipelineDescriptor* MVKGraphicsPipeline::newMTLRenderPipelineDescriptor
 																				 const SPIRVTessReflectionData& reflectData,
 																				 const VkPipelineShaderStageCreateInfo* pVertexSS,
 																				 VkPipelineCreationFeedback* pVertexFB,
+																				 const VkPipelineShaderStageCreateInfo* pGeometrySS,
+																				 VkPipelineCreationFeedback* pGeometryFB,
 																				 const VkPipelineShaderStageCreateInfo* pFragmentSS,
 																				 VkPipelineCreationFeedback* pFragmentFB) {
 	SPIRVToMSLConversionConfiguration shaderConfig;
@@ -1210,9 +1314,9 @@ MTLRenderPipelineDescriptor* MVKGraphicsPipeline::newMTLRenderPipelineDescriptor
 
 	MTLRenderPipelineDescriptor* plDesc = [MTLRenderPipelineDescriptor new];	// retained
 
-	SPIRVShaderOutputs vtxOutputs;
+	SPIRVShaderOutputs prevOutputs;
 	std::string errorLog;
-	if (!getShaderOutputs(_vertexModule->getSPIRV(), spv::ExecutionModelVertex, pVertexSS->pName, vtxOutputs, errorLog) ) {
+	if (!getShaderOutputs(_vertexModule->getSPIRV(), spv::ExecutionModelVertex, pVertexSS->pName, prevOutputs, errorLog) ) {
 		setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "Failed to get vertex outputs: %s", errorLog.c_str()));
 		return nil;
 	}
@@ -1220,12 +1324,30 @@ MTLRenderPipelineDescriptor* MVKGraphicsPipeline::newMTLRenderPipelineDescriptor
 	// Add shader stages. Compile vertex shader before others just in case conversion changes anything...like rasterizaion disable.
 	if (!addVertexShaderToPipeline(plDesc, pCreateInfo, shaderConfig, pVertexSS, pVertexFB, pFragmentSS)) { return nil; }
 
-	// Vertex input
-	// This needs to happen before compiling the fragment shader, or we'll lose information on vertex attributes.
-	if (!addVertexInputToPipeline(plDesc.vertexDescriptor, pCreateInfo->pVertexInputState, shaderConfig)) { return nil; }
+	if (_isGeometryMeshPipeline) {
+		if (!pGeometrySS) {
+			setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "Internal error: geometry stage missing for geometry emulation pipeline."));
+			return nil;
+		}
+
+		// Geometry emulation object shaders fetch vertex data manually, but we still need
+		// to resolve and validate vertex bindings for draw-time binding.
+		MTLVertexDescriptor* dummyVertexDesc = [MTLVertexDescriptor vertexDescriptor];
+		if (!addVertexInputToPipeline(dummyVertexDesc, pCreateInfo->pVertexInputState, shaderConfig)) { return nil; }
+
+		if (!addGeometryShaderToPipeline(plDesc, pCreateInfo, shaderConfig, prevOutputs, pGeometrySS, pGeometryFB, pFragmentSS)) { return nil; }
+		if (!getShaderOutputs(_geometryModule->getSPIRV(), spv::ExecutionModelGeometry, pGeometrySS->pName, prevOutputs, errorLog) ) {
+			setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "Failed to get geometry outputs: %s", errorLog.c_str()));
+			return nil;
+		}
+	} else {
+		// Vertex input
+		// This needs to happen before compiling the fragment shader, or we'll lose information on vertex attributes.
+		if (!addVertexInputToPipeline(plDesc.vertexDescriptor, pCreateInfo->pVertexInputState, shaderConfig)) { return nil; }
+	}
 
 	// Fragment shader - only add if rasterization is enabled
-	if (!addFragmentShaderToPipeline(plDesc, pCreateInfo, shaderConfig, vtxOutputs, pFragmentSS, pFragmentFB)) { return nil; }
+	if (!addFragmentShaderToPipeline(plDesc, pCreateInfo, shaderConfig, prevOutputs, pFragmentSS, pFragmentFB)) { return nil; }
 
 	// Output
 	addFragmentOutputToPipeline(plDesc, pCreateInfo);
@@ -1520,31 +1642,80 @@ bool MVKGraphicsPipeline::addVertexShaderToPipeline(MTLRenderPipelineDescriptor*
 													const VkPipelineShaderStageCreateInfo* pVertexSS,
 													VkPipelineCreationFeedback* pVertexFB,
 													const VkPipelineShaderStageCreateInfo*& pFragmentSS) {
+	const bool isMeshPipeline = _isGeometryMeshPipeline;
 	const auto& implicit = _stageResources[kMVKShaderStageVertex].implicitBuffers.ids;
 	shaderConfig.options.entryPointStage = spv::ExecutionModelVertex;
 	shaderConfig.options.entryPointName = pVertexSS->pName;
 	addCommonImplicitBuffersToShaderConfig(shaderConfig, implicit);
 	shaderConfig.options.mslOptions.shader_output_buffer_index = implicit[MVKImplicitBuffer::Output];
 	shaderConfig.options.mslOptions.view_mask_buffer_index = implicit[MVKImplicitBuffer::ViewRange];
+	shaderConfig.options.mslOptions.draw_info_index = implicit[MVKImplicitBuffer::IndirectParams];
 	shaderConfig.options.mslOptions.capture_output_to_buffer = false;
-	shaderConfig.options.mslOptions.disable_rasterization = !_isRasterizing;
+	shaderConfig.options.mslOptions.disable_rasterization = isMeshPipeline || !_isRasterizing;
+	shaderConfig.options.mslOptions.for_mesh_pipeline = isMeshPipeline;
+	shaderConfig.options.mslOptions.input_primitive_type = _geometryInputPrimitiveType;
     addVertexInputToShaderConversionConfig(shaderConfig, pCreateInfo);
 
 	MVKMTLFunction func = getMTLFunction(shaderConfig, pVertexSS, pVertexFB, _vertexModule, "Vertex");
 	id<MTLFunction> mtlFunc = func.getMTLFunction();
-	plDesc.vertexFunction = mtlFunc;
+	if (isMeshPipeline) {
+		mvkSetObjectFunction(plDesc, mtlFunc);
+	} else {
+		plDesc.vertexFunction = mtlFunc;
+	}
 	if ( !mtlFunc ) { return false; }
 
 	auto& funcRslts = func.shaderConversionResults;
-	plDesc.rasterizationEnabled = !funcRslts.isRasterizationDisabled;
+	if (!isMeshPipeline) {
+		plDesc.rasterizationEnabled = !funcRslts.isRasterizationDisabled;
+	}
 	populateResourceUsage(_stageResources[kMVKShaderStageVertex], shaderConfig, funcRslts, spv::ExecutionModelVertex);
 	_layout->populateBindOperations(_stageResources[kMVKShaderStageVertex].bindScript, shaderConfig, spv::ExecutionModelVertex);
+	if (isMeshPipeline) {
+		_stageResources[kMVKShaderStageVertex].implicitBuffers.needed.set(MVKImplicitBuffer::IndirectParams, true);
+	}
+
+	if (!isMeshPipeline && funcRslts.isRasterizationDisabled) {
+		pFragmentSS = nullptr;
+	}
+
+	return verifyImplicitBuffers(kMVKShaderStageVertex);
+}
+
+bool MVKGraphicsPipeline::addGeometryShaderToPipeline(MTLRenderPipelineDescriptor* plDesc,
+													   const VkGraphicsPipelineCreateInfo* pCreateInfo,
+													   SPIRVToMSLConversionConfiguration& shaderConfig,
+													   SPIRVShaderOutputs& vtxOutputs,
+													   const VkPipelineShaderStageCreateInfo* pGeometrySS,
+													   VkPipelineCreationFeedback* pGeometryFB,
+													   const VkPipelineShaderStageCreateInfo*& pFragmentSS) {
+	assert(_isGeometryMeshPipeline);
+	(void)pCreateInfo;
+	const auto& implicit = _stageResources[kMVKShaderStageGeometry].implicitBuffers.ids;
+	shaderConfig.options.entryPointStage = spv::ExecutionModelGeometry;
+	shaderConfig.options.entryPointName = pGeometrySS->pName;
+	addCommonImplicitBuffersToShaderConfig(shaderConfig, implicit);
+	shaderConfig.options.mslOptions.capture_output_to_buffer = false;
+	shaderConfig.options.mslOptions.disable_rasterization = !_isRasterizing;
+	shaderConfig.options.mslOptions.for_mesh_pipeline = true;
+	shaderConfig.options.mslOptions.input_primitive_type = _geometryInputPrimitiveType;
+	addPrevStageOutputToShaderConversionConfig(shaderConfig, vtxOutputs);
+
+	MVKMTLFunction func = getMTLFunction(shaderConfig, pGeometrySS, pGeometryFB, _geometryModule, "Geometry");
+	id<MTLFunction> mtlFunc = func.getMTLFunction();
+	mvkSetMeshFunction(plDesc, mtlFunc);
+	if (!mtlFunc) { return false; }
+
+	auto& funcRslts = func.shaderConversionResults;
+	plDesc.rasterizationEnabled = !funcRslts.isRasterizationDisabled;
+	populateResourceUsage(_stageResources[kMVKShaderStageGeometry], shaderConfig, funcRslts, spv::ExecutionModelGeometry);
+	_layout->populateBindOperations(_stageResources[kMVKShaderStageGeometry].bindScript, shaderConfig, spv::ExecutionModelGeometry);
 
 	if (funcRslts.isRasterizationDisabled) {
 		pFragmentSS = nullptr;
 	}
 
-	return verifyImplicitBuffers(kMVKShaderStageVertex);
+	return verifyImplicitBuffers(kMVKShaderStageGeometry);
 }
 
 // Adds a vertex shader compiled as a compute kernel to the pipeline description.
@@ -1679,6 +1850,7 @@ bool MVKGraphicsPipeline::addFragmentShaderToPipeline(MTLRenderPipelineDescripto
 		shaderConfig.options.mslOptions.view_mask_buffer_index = implicit[MVKImplicitBuffer::ViewRange];
 		shaderConfig.options.entryPointName = pFragmentSS->pName;
 		shaderConfig.options.mslOptions.capture_output_to_buffer = false;
+		shaderConfig.options.mslOptions.for_mesh_pipeline = false;
 		shaderConfig.options.mslOptions.fixed_subgroup_size = mvkIsAnyFlagEnabled(pFragmentSS->flags, VK_PIPELINE_SHADER_STAGE_CREATE_ALLOW_VARYING_SUBGROUP_SIZE_BIT) ? 0 : mtlFeats.maxSubgroupSize;
 		shaderConfig.options.mslOptions.check_discarded_frag_stores = true;
 		/* Enabling makes dEQP-VK.fragment_shader_interlock.basic.discard.image.pixel_ordered.1xaa.no_sample_shading.1024x1024 and similar tests fail. Requires investigation */
@@ -2090,6 +2262,9 @@ void MVKGraphicsPipeline::initShaderConversionConfig(SPIRVToMSLConversionConfigu
 				// view range buffer as for the tessellation index buffer.
 				_stageResources[stage].implicitBuffers.ids[MVKImplicitBuffer::ViewRange] = extra;
 				_stageResources[stage].implicitBuffers.ids[MVKImplicitBuffer::Index]     = extra;
+				if (_isGeometryMeshPipeline) {
+					_stageResources[stage].implicitBuffers.ids[MVKImplicitBuffer::IndirectParams] = getImplicitBufferIndex(stage, 4);
+				}
 				break;
 			case kMVKShaderStageFragment:
 				_stageResources[stage].implicitBuffers.ids[MVKImplicitBuffer::ViewRange] = extra;
@@ -2401,6 +2576,7 @@ MVKGraphicsPipeline::~MVKGraphicsPipeline() {
 		if (_ownsVertexModule) delete _vertexModule;
 		if (_ownsTessCtlModule) delete _tessCtlModule;
 		if (_ownsTessEvalModule) delete _tessEvalModule;
+		if (_ownsGeometryModule) delete _geometryModule;
 		if (_ownsFragmentModule) delete _fragmentModule;
 	}
 }
