@@ -408,6 +408,12 @@ public:
 	/** Populates the specified structure with the Metal-specific features of this device. */
 	const MVKPhysicalDeviceMetalFeatures* getMetalFeatures() const { return &_metalFeatures; }
 
+	/** Returns whether the current Metal runtime can support geometry emulation via object/mesh stages. */
+	bool supportsGeometryShaderEmulationRuntime();
+
+	/** Returns whether geometry-shader emulation is fully available (runtime support + config enabled). */
+	bool supportsGeometryShaderEmulation();
+
 	/** Returns whether argument buffers are in use. */
 	bool isUsingMetalArgumentBuffers() const { return _isUsingMetalArgumentBuffers; }
 

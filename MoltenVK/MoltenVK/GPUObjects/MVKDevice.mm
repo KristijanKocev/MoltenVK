@@ -2733,11 +2733,40 @@ bool MVKPhysicalDevice::isTier2MetalArgumentBuffers() {
 	return _isUsingMetalArgumentBuffers && (_metalFeatures.argumentBuffersTier >= MTLArgumentBuffersTier2);
 }
 
+bool MVKPhysicalDevice::supportsGeometryShaderEmulationRuntime() {
+	if (_metalFeatures.mslVersion < SPIRV_CROSS_NAMESPACE::CompilerMSL::Options::make_msl_version(3, 0, 0)) {
+		return false;
+	}
+	if (![_mtlDevice respondsToSelector:@selector(supportsFamily:)]) {
+		return false;
+	}
+#if MVK_MACOS
+	if (![_mtlDevice supportsFamily:MTLGPUFamilyMac2]) {
+		return false;
+	}
+#else
+	if (![_mtlDevice supportsFamily:MTLGPUFamilyApple7]) {
+		return false;
+	}
+#endif
+	if (![MTLRenderPipelineDescriptor instancesRespondToSelector:@selector(setObjectFunction:)]) {
+		return false;
+	}
+	if (![MTLRenderPipelineDescriptor instancesRespondToSelector:@selector(setMeshFunction:)]) {
+		return false;
+	}
+	return true;
+}
+
+bool MVKPhysicalDevice::supportsGeometryShaderEmulation() {
+	return getMVKConfig().geometryShaderEmulationEnabled && supportsGeometryShaderEmulationRuntime();
+}
+
 // Initializes the physical device features of this instance.
 void MVKPhysicalDevice::initFeatures() {
 	mvkClear(&_features);	// Start with everything cleared
 
-	const bool geometryShaderEmulationEnabled = getMVKConfig().geometryShaderEmulationEnabled;
+	const bool geometryShaderEmulationEnabled = supportsGeometryShaderEmulation();
 
     _features.robustBufferAccess = true; // NOTE: Required by spec, not fully supported by non-Apple GPUs.
     _features.fullDrawIndexUint32 = true;

@@ -1085,29 +1085,7 @@ id<MTLComputePipelineState> MVKGraphicsPipeline::getOrCompilePipeline(MTLCompute
 }
 
 bool MVKGraphicsPipeline::supportsGeometryMeshPipeline() const {
-	if (getMetalFeatures().mslVersion < CompilerMSL::Options::make_msl_version(3, 0, 0)) {
-		return false;
-	}
-	id<MTLDevice> mtlDev = getMTLDevice();
-	if (![mtlDev respondsToSelector:@selector(supportsFamily:)]) {
-		return false;
-	}
-#if MVK_MACOS
-	if (![mtlDev supportsFamily:MTLGPUFamilyMac2]) {
-		return false;
-	}
-#else
-	if (![mtlDev supportsFamily:MTLGPUFamilyApple7]) {
-		return false;
-	}
-#endif
-	if (![MTLRenderPipelineDescriptor instancesRespondToSelector:@selector(setObjectFunction:)]) {
-		return false;
-	}
-	if (![MTLRenderPipelineDescriptor instancesRespondToSelector:@selector(setMeshFunction:)]) {
-		return false;
-	}
-	return true;
+	return getPhysicalDevice()->supportsGeometryShaderEmulationRuntime();
 }
 
 bool MVKGraphicsPipeline::initGeometryMeshPipelineConfig(const VkGraphicsPipelineCreateInfo* pCreateInfo) {
@@ -2375,13 +2353,30 @@ void MVKGraphicsPipeline::addVertexInputToShaderConversionConfig(SPIRVToMSLConve
                                                                  const VkGraphicsPipelineCreateInfo* pCreateInfo) {
     // Set the shader conversion config vertex attribute information
     shaderConfig.shaderInputs.clear();
-    uint32_t vaCnt = pCreateInfo->pVertexInputState->vertexAttributeDescriptionCount;
+
+	const VkPipelineVertexInputStateCreateInfo* pVI = pCreateInfo->pVertexInputState;
+	auto getBindingStride = [&](uint32_t binding) -> uint32_t {
+		uint32_t vbCnt = pVI->vertexBindingDescriptionCount;
+		for (uint32_t vbIdx = 0; vbIdx < vbCnt; vbIdx++) {
+			const VkVertexInputBindingDescription* pVKVB = &pVI->pVertexBindingDescriptions[vbIdx];
+			if (pVKVB->binding == binding) {
+				return pVKVB->stride;
+			}
+		}
+		return 0;
+	};
+
+    uint32_t vaCnt = pVI->vertexAttributeDescriptionCount;
     for (uint32_t vaIdx = 0; vaIdx < vaCnt; vaIdx++) {
-        const VkVertexInputAttributeDescription* pVKVA = &pCreateInfo->pVertexInputState->pVertexAttributeDescriptions[vaIdx];
+        const VkVertexInputAttributeDescription* pVKVA = &pVI->pVertexAttributeDescriptions[vaIdx];
 
         // Set binding and offset from Vulkan vertex attribute
         mvk::MSLShaderInput si;
-        si.shaderVar.location = pVKVA->location;
+		auto& sisv = si.shaderVar;
+        sisv.location = pVKVA->location;
+		sisv.binding = pVKVA->binding;
+		sisv.offset = pVKVA->offset;
+		sisv.stride = getBindingStride(pVKVA->binding);
         si.binding = pVKVA->binding;
 
         // Metal can't do signedness conversions on vertex buffers (rdar://45922847). If the shader
@@ -2391,11 +2386,11 @@ void MVKGraphicsPipeline::addVertexInputToShaderConversionConfig(SPIRVToMSLConve
         // declared type. Programs that try to invoke undefined behavior are on their own.
         switch (getPixelFormats()->getFormatType(pVKVA->format) ) {
         case kMVKFormatColorUInt8:
-            si.shaderVar.format = MSL_SHADER_VARIABLE_FORMAT_UINT8;
+            sisv.format = MSL_SHADER_VARIABLE_FORMAT_UINT8;
             break;
 
         case kMVKFormatColorUInt16:
-            si.shaderVar.format = MSL_SHADER_VARIABLE_FORMAT_UINT16;
+            sisv.format = MSL_SHADER_VARIABLE_FORMAT_UINT16;
             break;
 
         case kMVKFormatDepthStencil:
@@ -2405,7 +2400,7 @@ void MVKGraphicsPipeline::addVertexInputToShaderConversionConfig(SPIRVToMSLConve
             case VK_FORMAT_D16_UNORM_S8_UINT:
             case VK_FORMAT_D24_UNORM_S8_UINT:
             case VK_FORMAT_D32_SFLOAT_S8_UINT:
-                si.shaderVar.format = MSL_SHADER_VARIABLE_FORMAT_UINT8;
+                sisv.format = MSL_SHADER_VARIABLE_FORMAT_UINT8;
                 break;
 
             default:
