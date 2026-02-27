@@ -27,6 +27,7 @@
 #include "mvk_datatypes.hpp"
 #include <sys/stat.h>
 #include <sstream>
+#include <atomic>
 
 #ifndef MVK_USE_CEREAL
 #define MVK_USE_CEREAL (1)
@@ -69,6 +70,7 @@ static spv::ExecutionModel spvExecModelForStage(MVKShaderStage stage) {
 		case kMVKShaderStageVertex:   return spv::ExecutionModelVertex;
 		case kMVKShaderStageTessCtl:  return spv::ExecutionModelTessellationControl;
 		case kMVKShaderStageTessEval: return spv::ExecutionModelTessellationEvaluation;
+		case kMVKShaderStageGeometry: return spv::ExecutionModelGeometry;
 		case kMVKShaderStageFragment: return spv::ExecutionModelFragment;
 		case kMVKShaderStageCompute:  return spv::ExecutionModelGLCompute;
 		case kMVKShaderStageCount:
@@ -698,6 +700,15 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
 	return false;
 }
 
+static void warnGeometryShaderPassthrough(MVKGraphicsPipeline* pipeline) {
+	static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+	if (!warned.test_and_set()) {
+		pipeline->reportWarning(VK_SUCCESS,
+								"Geometry shader emulation is enabled, but this build currently uses "
+								"an experimental passthrough fallback. Visual output may be incorrect.");
+	}
+}
+
 MVKGraphicsPipeline::MVKGraphicsPipeline(MVKDevice* device,
 										 MVKPipelineCache* pipelineCache,
 										 MVKPipeline* parent,
@@ -751,10 +762,12 @@ MVKGraphicsPipeline::MVKGraphicsPipeline(MVKDevice* device,
 	const VkPipelineShaderStageCreateInfo* pVertexSS = nullptr;
 	const VkPipelineShaderStageCreateInfo* pTessCtlSS = nullptr;
 	const VkPipelineShaderStageCreateInfo* pTessEvalSS = nullptr;
+	const VkPipelineShaderStageCreateInfo* pGeometrySS = nullptr;
 	const VkPipelineShaderStageCreateInfo* pFragmentSS = nullptr;
 	VkPipelineCreationFeedback* pVertexFB = nullptr;
 	VkPipelineCreationFeedback* pTessCtlFB = nullptr;
 	VkPipelineCreationFeedback* pTessEvalFB = nullptr;
+	VkPipelineCreationFeedback* pGeometryFB = nullptr;
 	VkPipelineCreationFeedback* pFragmentFB = nullptr;
 	for (uint32_t i = 0; i < pCreateInfo->stageCount; i++) {
 		const auto* pSS = &pCreateInfo->pStages[i];
@@ -777,6 +790,12 @@ MVKGraphicsPipeline::MVKGraphicsPipeline(MVKDevice* device,
 					pTessEvalFB = &pFeedbackInfo->pPipelineStageCreationFeedbacks[i];
 				}
 				break;
+			case VK_SHADER_STAGE_GEOMETRY_BIT:
+				pGeometrySS = pSS;
+				if (pFeedbackInfo && pFeedbackInfo->pPipelineStageCreationFeedbacks) {
+					pGeometryFB = &pFeedbackInfo->pPipelineStageCreationFeedbacks[i];
+				}
+				break;
 			case VK_SHADER_STAGE_FRAGMENT_BIT:
 				pFragmentSS = pSS;
 				if (pFeedbackInfo && pFeedbackInfo->pPipelineStageCreationFeedbacks) {
@@ -788,6 +807,20 @@ MVKGraphicsPipeline::MVKGraphicsPipeline(MVKDevice* device,
 		}
 	}
 
+	if (pGeometrySS) {
+		if (!getMVKConfig().geometryShaderEmulationEnabled) {
+			setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT,
+											   "Geometry shaders are disabled. Enable "
+											   "MVK_CONFIG_GEOMETRY_SHADER_EMULATION to allow the "
+											   "experimental geometry passthrough fallback."));
+			return;
+		}
+		warnGeometryShaderPassthrough(this);
+		if (pGeometryFB) {
+			mvkDisableFlags(pGeometryFB->flags, VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT);
+		}
+	}
+
 	_vertexModule = getOrCreateShaderModule(device, pVertexSS, _ownsVertexModule);
 	_tessCtlModule = getOrCreateShaderModule(device, pTessCtlSS, _ownsTessCtlModule);
 	_tessEvalModule = getOrCreateShaderModule(device, pTessEvalSS, _ownsTessEvalModule);
@@ -796,6 +829,7 @@ MVKGraphicsPipeline::MVKGraphicsPipeline(MVKDevice* device,
 	warnIfUnsupportedRobustnessEnabled(this, pVertexSS);
 	warnIfUnsupportedRobustnessEnabled(this, pTessCtlSS);
 	warnIfUnsupportedRobustnessEnabled(this, pTessEvalSS);
+	warnIfUnsupportedRobustnessEnabled(this, pGeometrySS);
 	warnIfUnsupportedRobustnessEnabled(this, pFragmentSS);
 
 	// Get the tessellation parameters from the shaders.
@@ -1472,6 +1506,7 @@ bool MVKGraphicsPipeline::verifyImplicitBuffers(MVKShaderStage stage) {
 		"Vertex",
 		"Tessellation control",
 		"Tessellation evaluation",
+		"Geometry",
 		"Fragment"
 	};
 

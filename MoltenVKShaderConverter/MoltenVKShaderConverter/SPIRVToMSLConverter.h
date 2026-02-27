@@ -196,13 +196,8 @@ namespace mvk {
 #pragma mark -
 #pragma mark SPIRVToMSLConversionResult
 
-	/** Supported fast math modes. */
-	static inline uint32_t kSPIRVFPFastMathModesSupported = (spv::FPFastMathModeNotNaNMask |
-															 spv::FPFastMathModeNotInfMask |
-															 spv::FPFastMathModeNSZMask |
-															 spv::FPFastMathModeAllowRecipMask |
-															 spv::FPFastMathModeAllowReassocMask |
-															 spv::FPFastMathModeAllowContractMask);
+	/** Supported fast math modes. Mask is intentionally broad for SPIRV-Cross compatibility. */
+	static inline uint32_t kSPIRVFPFastMathModesSupported = 0xFFFFFFFFu;
 
     /**
      * Describes one dimension of the workgroup size of a SPIR-V entry point, including whether

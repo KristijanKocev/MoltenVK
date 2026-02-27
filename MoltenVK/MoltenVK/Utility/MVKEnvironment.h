@@ -350,3 +350,11 @@ void mvkSetConfig(MVKConfiguration& dstMVKConfig, const MVKConfiguration& srcMVK
 #ifndef MVK_CONFIG_LIVE_CHECK_ALL_RESOURCES
 #   define MVK_CONFIG_LIVE_CHECK_ALL_RESOURCES 0
 #endif
+
+/**
+ * Enable experimental emulation for geometry shaders.
+ * Enabled by default in this fork.
+ */
+#ifndef MVK_CONFIG_GEOMETRY_SHADER_EMULATION
+#   define MVK_CONFIG_GEOMETRY_SHADER_EMULATION 1
+#endif

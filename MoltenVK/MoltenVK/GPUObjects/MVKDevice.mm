@@ -2737,6 +2737,8 @@ bool MVKPhysicalDevice::isTier2MetalArgumentBuffers() {
 void MVKPhysicalDevice::initFeatures() {
 	mvkClear(&_features);	// Start with everything cleared
 
+	const bool geometryShaderEmulationEnabled = getMVKConfig().geometryShaderEmulationEnabled;
+
     _features.robustBufferAccess = true; // NOTE: Required by spec, not fully supported by non-Apple GPUs.
     _features.fullDrawIndexUint32 = true;
     _features.independentBlend = true;
@@ -2760,6 +2762,7 @@ void MVKPhysicalDevice::initFeatures() {
     _features.inheritedQueries = true;
 	_features.vertexPipelineStoresAndAtomics = true;
 	_features.fragmentStoresAndAtomics = true;
+	_features.geometryShader = geometryShaderEmulationEnabled;
 
 	_features.shaderSampledImageArrayDynamicIndexing = _metalFeatures.arrayOfTextures;
 	_features.textureCompressionBC = _gpuCapabilities.supportsBCTextureCompression;
@@ -3087,11 +3090,20 @@ void MVKPhysicalDevice::initLimits() {
 
     _properties.limits.sparseAddressSpaceSize = 0;
 
-    _properties.limits.maxGeometryShaderInvocations = 0;
-    _properties.limits.maxGeometryInputComponents = 0;
-    _properties.limits.maxGeometryOutputComponents = 0;
-    _properties.limits.maxGeometryOutputVertices = 0;
-    _properties.limits.maxGeometryTotalOutputComponents = 0;
+	if (_features.geometryShader) {
+		// Vulkan minimum geometry-shader limits.
+		_properties.limits.maxGeometryShaderInvocations = 32;
+		_properties.limits.maxGeometryInputComponents = 64;
+		_properties.limits.maxGeometryOutputComponents = 128;
+		_properties.limits.maxGeometryOutputVertices = 256;
+		_properties.limits.maxGeometryTotalOutputComponents = 1024;
+	} else {
+		_properties.limits.maxGeometryShaderInvocations = 0;
+		_properties.limits.maxGeometryInputComponents = 0;
+		_properties.limits.maxGeometryOutputComponents = 0;
+		_properties.limits.maxGeometryOutputVertices = 0;
+		_properties.limits.maxGeometryTotalOutputComponents = 0;
+	}
 }
 
 #if MVK_MACOS
@@ -4882,7 +4894,7 @@ MTLCompileOptions* MVKDevice::getMTLCompileOptions(uint32_t fpFastMathFlags,
 		MTLMathMode mtlMathMode = MTLMathModeSafe;
 		MTLMathFloatingPointFunctions mtlFPFuncs = MTLMathFloatingPointFunctionsPrecise;
 		if (mvkAreAllFlagsEnabled(fpFastMathFlags, (spv::FPFastMathModeNSZMask | spv::FPFastMathModeAllowRecipMask |
-													spv::FPFastMathModeAllowReassocMask | spv::FPFastMathModeAllowContractMask))) {
+													spv::FPFastMathModeFastMask))) {
 			mtlMathMode = MTLMathModeRelaxed;
 			if (mvkAreAllFlagsEnabled(fpFastMathFlags, (spv::FPFastMathModeNotNaNMask | spv::FPFastMathModeNotInfMask))) {
 				mtlMathMode = MTLMathModeFast;
